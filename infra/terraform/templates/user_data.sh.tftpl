@@ -1,0 +1,128 @@
+#!/bin/bash
+set -euo pipefail
+
+REGION="${region}"
+ARTIFACT_BUCKET="${artifact_bucket}"
+APP_JAR_KEY="${app_jar_key}"
+APP_JAR_PATH="/opt/app/app.jar"
+APP_PORT="${app_port}"
+S3_BUCKET="${s3_bucket}"
+DB_URL="${db_url}"
+DB_USERNAME="${db_username}"
+DB_PASSWORD="${db_password}"
+LOG_DIR="/var/log/app"
+LOG_FILE="$LOG_DIR/app.log"
+LOG_GROUP_NAME="${log_group_name}"
+ENABLE_CW_AGENT="${enable_cw_agent}"
+CW_NAMESPACE="${cw_namespace}"
+
+# Update and install dependencies
+amazon-linux-extras enable epel || true
+rpm --rebuilddb || true
+sleep 2
+
+DNF_OPTS="-y -q"
+dnf update $DNF_OPTS || true
+dnf install $DNF_OPTS awscli java-17-amazon-corretto unzip
+
+# Create app user and directories
+useradd -r -s /sbin/nologin appuser || true
+mkdir -p /opt/app "$LOG_DIR"
+chown -R appuser:appuser /opt/app "$LOG_DIR"
+
+# Download application JAR from S3 (retry until available)
+ATTEMPTS=60
+SLEEP_SECONDS=5
+COUNT=0
+until aws s3 cp "s3://$ARTIFACT_BUCKET/$APP_JAR_KEY" "$APP_JAR_PATH" --region "$REGION"; do
+  COUNT=$((COUNT+1))
+  if [ "$COUNT" -ge "$ATTEMPTS" ]; then
+    echo "Failed to download artifact after $ATTEMPTS attempts." >&2
+    exit 1
+  fi
+  echo "Artifact not available yet. Retry $COUNT/$ATTEMPTS..."
+  sleep "$SLEEP_SECONDS"
+done
+chown appuser:appuser "$APP_JAR_PATH"
+
+# Create systemd service
+cat >/etc/systemd/system/app.service <<SERVICE
+[Unit]
+Description=Spring Boot App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=appuser
+WorkingDirectory=/opt/app
+Environment=JAVA_OPTS=-Xms256m -Xmx512m
+Environment=DB_URL=$DB_URL
+Environment=DB_USERNAME=$DB_USERNAME
+Environment=DB_PASSWORD=$DB_PASSWORD
+Environment=AWS_REGION=$REGION
+Environment=S3_BUCKET=$S3_BUCKET
+Environment=CLOUDWATCH_ENABLED=true
+Environment=CLOUDWATCH_NAMESPACE=$CW_NAMESPACE
+Environment=LOG_FILE=$LOG_FILE
+ExecStart=/usr/bin/java $JAVA_OPTS -jar $APP_JAR_PATH
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable app
+
+# Configure CloudWatch Logs agent (optional)
+if [ "$ENABLE_CW_AGENT" = "true" ] || [ "$ENABLE_CW_AGENT" = "True" ]; then
+  dnf install $DNF_OPTS amazon-cloudwatch-agent || true
+  mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+  cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "$LOG_FILE",
+            "log_group_name": "$LOG_GROUP_NAME",
+            "log_stream_name": "{instance_id}/app.log",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S"
+          }
+        ]
+      }
+    }
+  },
+  "metrics": {
+    "append_dimensions": {
+      "InstanceId": "${instance_id}"
+    },
+    "aggregation_dimensions": [["InstanceId"]],
+    "metrics_collected": {
+      "mem": {"measurement": ["mem_used_percent"], "metrics_aggregation_interval": 60},
+      "disk": {"measurement": ["used_percent"], "resources": ["*"], "metrics_aggregation_interval": 60}
+    }
+  }
+}
+CWCFG
+  systemctl enable amazon-cloudwatch-agent
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s || true
+fi
+
+# Start the app after everything is ready
+systemctl start app
+
+# Open firewall port if needed (AL2023 uses nftables/iptables off by default)
+
+# Save some instance info
+cat >/etc/app.env <<ENV
+REGION=$REGION
+APP_PORT=$APP_PORT
+S3_BUCKET=$S3_BUCKET
+DB_URL=$DB_URL
+ENV
+
+# Done
+

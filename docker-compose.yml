@@ -1,0 +1,41 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    container_name: app-postgres
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  app:
+    build: .
+    image: backend-spring-aws:local
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/appdb
+      DB_USERNAME: app
+      DB_PASSWORD: secret
+      AWS_REGION: us-east-1
+      S3_BUCKET: my-app-bucket
+      CLOUDWATCH_ENABLED: "false"
+      CLOUDWATCH_NAMESPACE: BackendSpringAWS
+      LOG_FILE: /opt/app/app.log
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - app-logs:/opt/app
+volumes:
+  pgdata:
+  app-logs:
+
